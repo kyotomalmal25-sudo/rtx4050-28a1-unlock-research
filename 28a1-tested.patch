@@ -1,0 +1,169 @@
+diff --git a/kernel/gpu_unlock/arch_610.h b/kernel/gpu_unlock/arch_610.h
+index b39debd..2b2c6dd 100644
+--- a/kernel/gpu_unlock/arch_610.h
++++ b/kernel/gpu_unlock/arch_610.h
+@@ -25,5 +25,7 @@ enum gpu_unlock_booter_arch {
+ #define GU_AD107_RTX_4060_LAPTOP 0x28a0u
+ #define GU_AD107_RTX_4060_MOBILE 0x28e0u
+ #define GU_AD107_RTX_4050_MOBILE 0x28e1u
++/* Experimental admission only; MSI 28a1 hardware remains unvalidated. */
++#define GU_AD107_RTX_4050_LAPTOP 0x28a1u
+ 
+ #endif
+diff --git a/kernel/gpu_unlock/main.c b/kernel/gpu_unlock/main.c
+index 2ad31f1..fc05eeb 100644
+--- a/kernel/gpu_unlock/main.c
++++ b/kernel/gpu_unlock/main.c
+@@ -27,7 +27,7 @@ module_param(ad106_experimental, bool, 0444);
+ MODULE_PARM_DESC(ad106_experimental, "permit experimental 10de:2803 and 10de:2805 AD106 targets when listed by exact PCI address in targets");
+ static bool ad107_experimental;
+ module_param(ad107_experimental, bool, 0444);
+-MODULE_PARM_DESC(ad107_experimental, "permit experimental 10de:2882, 10de:28a0, 10de:28e0 and 10de:28e1 AD107 targets when listed by exact PCI address in targets");
++MODULE_PARM_DESC(ad107_experimental, "permit experimental 10de:2882, 10de:28a0, 10de:28e0, 10de:28e1 and 10de:28a1 AD107 targets when listed by exact PCI address in targets");
+ 
+ static bool rtx4070tis_ad102_experimental;
+ module_param(rtx4070tis_ad102_experimental, bool, 0444);
+@@ -87,6 +87,7 @@ static const struct experimental_id {
+ 	{ GU_AD107_RTX_4060_LAPTOP, &ad107_experimental, true, "AD107" },
+ 	{ GU_AD107_RTX_4060_MOBILE, &ad107_experimental, true, "AD107" },
+ 	{ GU_AD107_RTX_4050_MOBILE, &ad107_experimental, true, "AD107" },
++	{ GU_AD107_RTX_4050_LAPTOP, &ad107_experimental, true, "AD107 unvalidated 28a1" },
+ };
+ 
+ static ASYNC_DOMAIN_EXCLUSIVE(unlock_domain);
+diff --git a/kernel/gpu_unlock/unlock_610.c b/kernel/gpu_unlock/unlock_610.c
+index bb4de91..0027c1b 100644
+--- a/kernel/gpu_unlock/unlock_610.c
++++ b/kernel/gpu_unlock/unlock_610.c
+@@ -79,6 +79,7 @@ static bool ad102_family(unsigned short device)
+ 	case GU_AD107_RTX_4060_LAPTOP:
+ 	case GU_AD107_RTX_4060_MOBILE:
+ 	case GU_AD107_RTX_4050_MOBILE:
++	case GU_AD107_RTX_4050_LAPTOP:
+ 		return true;
+ 	default:
+ 		return false;
+diff --git a/tests/test_ad102_kernel.c b/tests/test_ad102_kernel.c
+index ef76b3b..4932b53 100644
+--- a/tests/test_ad102_kernel.c
++++ b/tests/test_ad102_kernel.c
+@@ -238,6 +238,22 @@ int main(int argc, char **argv)
+         puts("AD107 0x28e1 profile dispatch under mocked registers PASS");
+         }
+         {
++        /* Dispatch the same published AD102-family payload through the exact
++         * 0x28a1 profile under mocked registers. This is not silicon proof. */
++        ad102_setup(&w);dev.device=GU_AD107_RTX_4050_LAPTOP;load_rom(argv[1]);
++        regs[0x1183a4/4]=0x5ff4;regs[0x625f04/4]=1;regs[0x1fa7c8/4]=0x45cb8f;
++        regs[0x1fa82c/4]=0x100000;regs[0x1fa830/4]=0x5cf3ff0;
++        regs[(GU_FUSE_SEC2_UCODE1+2*4)/4]=1;
++        fake.fwsec_wpr=1;fake.fwsec_wpr_lo=0x5ff2000;fake.fwsec_wpr_hi=0x5ff2e00;
++        struct gpu_unlock_610_shared shared107={0};last_work=NULL;
++        assert(!gpu_unlock_610_load_shared(&dev,&shared107));
++        ret=gpu_unlock_610_unlock(&dev,&shared107);
++        gpu_unlock_610_release_shared(&shared107);
++        assert(!ret && fake.starts==1 && fake.gsp_starts==1 && fake.flrs==1);
++        assert(!fake.live && !fake.fw_live && dev.refs==1);
++        puts("AD107 0x28a1 profile dispatch under mocked registers PASS");
++        }
++        {
+         /* Dispatch the same published AD102-family payload through the exact
+          * 0x28e0 profile under mocked registers. This is not silicon proof. */
+         ad102_setup(&w);dev.device=GU_AD107_RTX_4060_MOBILE;load_rom(argv[1]);
+diff --git a/tests/test_ad104_boot_option.py b/tests/test_ad104_boot_option.py
+index 35b8c2a..bf68fbf 100644
+--- a/tests/test_ad104_boot_option.py
++++ b/tests/test_ad104_boot_option.py
+@@ -30,3 +30,13 @@ class AD104BootOptionTests(unittest.TestCase):
+         lines = output.getvalue().splitlines()
+         self.assertIn("RTX 4070 (experimental) at 0000:01:00.0 [10de:2786]:", lines)
+         self.assertIn("gpu_unlock.targets=0000:01:00.0 gpu_unlock.ad104_experimental=1", lines)
++
++
++class AD10728A1BootOptionTests(unittest.TestCase):
++    def test_28a1_exact_target_and_opt_in(self):
++        result = subprocess.CompletedProcess([], 0, "0000:01:00.0 VGA [10de:28a1]\n")
++        output = io.StringIO()
++        with mock.patch.object(boot.subprocess, "run", return_value=result), contextlib.redirect_stdout(output):
++            self.assertEqual(boot.main(), 0)
++        self.assertIn("UNVALIDATED", output.getvalue())
++        self.assertIn("gpu_unlock.targets=0000:01:00.0 gpu_unlock.ad107_experimental=1", output.getvalue())
+diff --git a/tests/test_main.c b/tests/test_main.c
+index d6c9a6a..611ba67 100644
+--- a/tests/test_main.c
++++ b/tests/test_main.c
+@@ -599,6 +599,41 @@ int main(void)
+ 	assert(fake.loads == 1 && fake.started == 1 && fake.unlocks[0]);
+ 	puts("ad107: gated exact-card dispatch PASS");
+ 
++	/* The AD107 target needs its own flag and its exact BDF in the list. */
++	reset("0000:01:00.0");
++	add("0000:01:00.0", GU_AD107_RTX_4050_LAPTOP, false);
++	run();
++	assert(!fake.loads && !fake.started);
++	assert(logged("no supported card at \"0000:01:00.0\""));
++	reset("0000:01:00.0");
++	ad106_experimental = true;
++	add("0000:01:00.0", GU_AD107_RTX_4050_LAPTOP, false);
++	run();
++	assert(!fake.loads && !fake.started);
++	reset("all");
++	ad107_experimental = true;
++	add("0000:01:00.0", GU_AD107_RTX_4050_LAPTOP, false);
++	run();
++	assert(!fake.loads && !fake.started);
++	assert(logged("experimental AD107 unvalidated 28a1 requires its exact PCI address in the list"));
++	reset("0000:01:00.0");
++	ad107_experimental = true;
++	add("0000:01:00.0", GU_AD107_RTX_4050_LAPTOP, false);
++	fake.expected_concurrent = 1;
++	run();
++	assert(fake.loads == 1 && fake.started == 1 && fake.unlocks[0]);
++    reset("0000:02:00.0");
++    ad107_experimental = true;
++    add("0000:01:00.0", GU_AD107_RTX_4050_LAPTOP, false);
++    run();
++    assert(!fake.loads && !fake.started);
++    reset("0000:01:00.0");
++    ad107_experimental = true;
++    add("0000:01:00.0", GU_AD107_RTX_4050_LAPTOP, true);
++    run();
++    assert(!fake.started && logged("unlock failed (-16)"));
++    puts("28a1: flag, exact BDF, all and bound-driver guards PASS");
++
+ 	/* The AD104 target needs its own flag and its exact BDF in the list. */
+ 	reset("0000:01:00.0");
+ 	add("0000:01:00.0", RTX_4070TI, false);
+diff --git a/tests/test_unlock_adapter.c b/tests/test_unlock_adapter.c
+index ca65ad8..24b27b7 100644
+--- a/tests/test_unlock_adapter.c
++++ b/tests/test_unlock_adapter.c
+@@ -51,6 +51,7 @@ static bool fake_ada_id(void) {
+            dev.device==GU_AD103_RTX_4070 ||
+            dev.device==GU_AD106_RTX_4060_TI_16GB ||
+            dev.device==GU_AD107_RTX_4050_MOBILE ||
++           dev.device==GU_AD107_RTX_4050_LAPTOP ||
+            dev.device==GU_AD104_RTX_4070 ||
+            dev.device==GU_AD104_RTX_4070_TI ||
+            dev.device==GU_AD102_RTX_4070_TI_SUPER ||
+@@ -395,7 +396,7 @@ int main(int argc, char **argv) {
+     assert(!strcmp(unlock_assets(&dev)->payload, V67_FILE_AD102));
+     assert(unlock_assets(&dev)->arch==GU_BOOTER_AD10X);
+     assert(is_ad102(&w));
+-    const unsigned short ad106_ids[]={GU_AD106_RTX_4060_TI,GU_AD106_RTX_4060_TI_16GB};
++    const unsigned short ad106_ids[]={GU_AD107_RTX_4050_LAPTOP,GU_AD106_RTX_4060_TI,GU_AD106_RTX_4060_TI_16GB};
+     for(unsigned i=0;i<ARRAY_SIZE(ad106_ids);i++) {
+         dev.device=ad106_ids[i];
+         assert(!strcmp(unlock_assets(&dev)->booter, BOOTER_FILE_AD102));
+diff --git a/tools/print_boot_option.py b/tools/print_boot_option.py
+index 5182eab..6dfd15e 100644
+--- a/tools/print_boot_option.py
++++ b/tools/print_boot_option.py
+@@ -23,6 +23,7 @@ TARGETS = {
+     "2882": ("RTX 4060 (experimental)", "ad107_experimental"),
+     "28a0": ("RTX 4060 Laptop GPU (experimental)", "ad107_experimental"),
+     "28e0": ("RTX 4060 Laptop GPU (experimental)", "ad107_experimental"),
++    "28a1": ("RTX 4050 Laptop GPU (UNVALIDATED)", "ad107_experimental"),
+     "28e1": ("RTX 4050 Laptop GPU (experimental)", "ad107_experimental"),
+ }
+ 
